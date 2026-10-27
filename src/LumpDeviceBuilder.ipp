@@ -16,7 +16,7 @@ namespace LumpDeviceBuilder {
       uint8_t txPin,
       uint8_t type,
       uint32_t speed,
-      LumpMode *modes,
+      const LumpMode *modes,
       uint8_t numModes,
       uint8_t view,
       uint32_t fwVersion,
@@ -37,6 +37,23 @@ namespace LumpDeviceBuilder {
   template <typename T>
   void LumpDevice<T>::begin() {
     LUMP_DEBUG_BEGIN(LUMP_DEBUG_SPEED);
+
+    /**
+     * Allocates one zeroed buffer shared by all writable modes (mapOut != NONE).
+     * Done here rather than in the constructor so it never depends on global initialization order.
+     */
+    uint16_t size = 0;
+    for (uint8_t i = 0; i < numModes; ++i) {
+      if (modes[i].isWritable()) {
+        size += align4(modes[i].dataMsgSize);
+      }
+    }
+    if (size != dataMsgBufSize || (size && !dataMsgBuf)) {
+      free(dataMsgBuf);
+      dataMsgBuf     = size ? static_cast<uint8_t *>(calloc(size, 1)) : nullptr;
+      dataMsgBufSize = dataMsgBuf ? size : 0;
+    }
+    dataMsgFlags = 0;
 
     deviceState     = LumpDeviceState::InitWdt;
     prevDeviceState = LumpDeviceState::InitWdt;
@@ -93,8 +110,9 @@ namespace LumpDeviceBuilder {
         _hasNack   = false;
         isLpf2Host = false;
         clearCmdWriteData();
-        for (uint8_t i = 0; i < numModes; ++i) {
-          clearDataMsg(i);
+        dataMsgFlags = 0;
+        if (dataMsgBuf) {
+          memset(dataMsgBuf, 0, dataMsgBufSize);
         }
 
         deviceState = LumpDeviceState::InitAutoId;
@@ -274,15 +292,47 @@ namespace LumpDeviceBuilder {
         LUMP_DEBUG_PRINTLN(modeIdx);
         LUMP_DEBUG_PRINTLN("[State] Sending name");
 
-        uint8_t nameLen = strlen(modes[modeIdx].name); // null terminator is not required by default.
+        const LumpMode &m = modes[modeIdx];
+
+        /**
+         * Name validation (moved here from the LumpMode constructor so the mode table can be constant).
+         * An invalid name (nullptr, empty, or not starting with a letter) is sent as "null".
+         */
+        static const char nullName[LUMP_MAX_SHORT_NAME_SIZE + 8]{"null"};
+        const char *name = nullName;
+        if (m.flagsInName) {
+          if (m.name) {
+            name = m.name;
+          }
+        } else if (m.name && isalpha(static_cast<unsigned char>(m.name[0]))) {
+          name = m.name;
+        }
+
+        uint8_t nameLen = boundedStrlen(name, LUMP_MAX_NAME_SIZE); // null terminator is not required by default.
+
+#ifndef LUMP_FIX_SHORT_NAME
+        /**
+         * Reproduces the byte-exact output of library versions that copied the name into a buffer
+         * pre-filled with "null": names shorter than 4 characters keep the tail of "null"
+         * (e.g. "HSV" is sent as "HSVl"). Define LUMP_FIX_SHORT_NAME to send the name as written.
+         */
+        char legacyName[5];
+        if (!m.flagsInName && nameLen < 4) {
+          memcpy(legacyName, nullName, sizeof(legacyName));
+          memcpy(legacyName, name, nameLen);
+          name    = legacyName;
+          nameLen = 4;
+        }
+#endif
+
         uint8_t msgSize = queryNextPow2(nameLen);
 
         memset(txBuffer, 0, sizeof(txBuffer));
 
-        if (modes[modeIdx].flagsInName) {
+        if (m.flagsInName) {
           nameLen = LUMP_MAX_SHORT_NAME_SIZE + 7;
           msgSize = queryNextPow2(LUMP_MAX_SHORT_NAME_SIZE + 7); // 1 for short name's null terminator, 6 for flags.
-        } else if (modes[modeIdx].power) {
+        } else if (m.power) {
           nameLen = min(nameLen, static_cast<uint8_t>(LUMP_MAX_SHORT_NAME_SIZE));
           msgSize = queryNextPow2(LUMP_MAX_SHORT_NAME_SIZE + 7); // 1 for short name's null terminator, 6 for flags.
 
@@ -292,7 +342,7 @@ namespace LumpDeviceBuilder {
 
         txBuffer[0] = encMsgHeader(LUMP_MSG_TYPE_INFO, msgSize, modeIdx % (LUMP_MAX_MODE + 1));
         txBuffer[1] = LUMP_INFO_NAME | LUMP_INFO_MODE(modeIdx);
-        memcpy(&txBuffer[2], modes[modeIdx].name, nameLen);
+        memcpy(&txBuffer[2], name, nameLen);
         txBuffer[msgSize + 2] = calcChecksum(txBuffer, msgSize + 2);
         uartWrite(txBuffer, msgSize + 3);
 
@@ -315,14 +365,15 @@ namespace LumpDeviceBuilder {
         /* Sends the symbol. */
         LUMP_DEBUG_PRINTLN("[State] Sending symbol");
 
-        if (strlen(modes[modeIdx].symbol) > 0) {
-          size_t symbolLen = strlen(modes[modeIdx].symbol); // null terminator is not required.
+        const char *symbol = modes[modeIdx].symbol;
+        if (symbol && symbol[0] != '\0') {
+          size_t symbolLen = boundedStrlen(symbol, LUMP_MAX_UOM_SIZE); // null terminator is not required.
           size_t msgSize   = queryNextPow2(symbolLen);
 
           memset(txBuffer, 0, sizeof(txBuffer));
           txBuffer[0] = encMsgHeader(LUMP_MSG_TYPE_INFO, msgSize, modeIdx % (LUMP_MAX_MODE + 1));
           txBuffer[1] = LUMP_INFO_UNITS | LUMP_INFO_MODE(modeIdx);
-          memcpy(&txBuffer[2], modes[modeIdx].symbol, symbolLen);
+          memcpy(&txBuffer[2], symbol, symbolLen);
           txBuffer[msgSize + 2] = calcChecksum(txBuffer, msgSize + 2);
           uartWrite(txBuffer, msgSize + 3);
         }
@@ -638,19 +689,19 @@ namespace LumpDeviceBuilder {
           case LUMP_MSG_TYPE_DATA:
             if (deviceState == LumpDeviceState::Communicating) {
               uint8_t mode = msgCmd + extMode;
+              uint8_t *buf = dataMsgPtr(mode);
+              bool isValid = buf && msgSize >= modes[mode].dataMsgSize;
 
-              if (mode < numModes && modes[mode].dataMsg && msgSize >= modes[mode].dataMsgSize) {
-                memcpy(modes[mode].dataMsg, &rxBuffer[1], modes[mode].dataMsgSize);
-                modes[mode].hasDataMsg = true;
+              if (isValid) {
+                memcpy(buf, &rxBuffer[1], modes[mode].dataMsgSize);
+                dataMsgFlags |= static_cast<uint16_t>(1u << mode);
               }
 
               LUMP_DEBUG_PRINT("| data msg, mode: ");
               LUMP_DEBUG_PRINT(mode);
               LUMP_DEBUG_PRINT(", size: ");
               LUMP_DEBUG_PRINT(msgSize);
-              LUMP_DEBUG_PRINTLN(
-                  (mode < numModes && modes[mode].dataMsg && msgSize >= modes[mode].dataMsgSize) ? "" : ", invalid"
-              );
+              LUMP_DEBUG_PRINTLN(isValid ? "" : ", invalid");
             }
             break;
           default:
@@ -717,18 +768,33 @@ namespace LumpDeviceBuilder {
   }
 
   template <typename T>
+  uint8_t *LumpDevice<T>::dataMsgPtr(uint8_t mode) {
+    if (!dataMsgBuf || mode >= numModes || !modes[mode].isWritable()) {
+      return nullptr;
+    }
+    uint16_t offset = 0;
+    for (uint8_t i = 0; i < mode; ++i) {
+      if (modes[i].isWritable()) {
+        offset += align4(modes[i].dataMsgSize);
+      }
+    }
+    return dataMsgBuf + offset;
+  }
+
+  template <typename T>
   void LumpDevice<T>::clearDataMsg(uint8_t mode) {
-    if (modes[mode].dataMsg) {
-      modes[mode].hasDataMsg = false;
-      memset(modes[mode].dataMsg, 0, modes[mode].dataMsgSize);
+    uint8_t *buf = dataMsgPtr(mode);
+    if (buf) {
+      dataMsgFlags &= static_cast<uint16_t>(~(1u << mode));
+      memset(buf, 0, modes[mode].dataMsgSize);
     }
   }
 
   template <typename T>
   bool LumpDevice<T>::hasDataMsg(uint8_t mode) {
     if (mode < numModes) {
-      bool tmp               = modes[mode].hasDataMsg;
-      modes[mode].hasDataMsg = false;
+      bool tmp = dataMsgFlags & (1u << mode);
+      dataMsgFlags &= static_cast<uint16_t>(~(1u << mode));
       return tmp;
     }
     return false;
@@ -737,10 +803,7 @@ namespace LumpDeviceBuilder {
   template <typename T>
   template <typename U>
   U *LumpDevice<T>::readDataMsg(uint8_t mode) {
-    if (mode < numModes && modes[mode].dataMsg) {
-      return reinterpret_cast<U *>(modes[mode].dataMsg);
-    }
-    return nullptr;
+    return reinterpret_cast<U *>(dataMsgPtr(mode));
   }
 
   template <typename T>

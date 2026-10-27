@@ -15,6 +15,37 @@
 #include "lump_ext.h"
 #include <Arduino.h>
 
+/* Compile-time helpers (must be visible before LumpMode). */
+namespace LumpDeviceBuilder {
+namespace Internal {
+
+  /**
+   * Queries size of the LUMP data type.
+   *
+   * @param dataType LUMP data type.
+   * @return Size of the data type in bytes.
+   */
+  constexpr uint8_t sizeOfLumpDataType(uint8_t dataType) {
+    return (dataType == LUMP_DATA_TYPE_DATA8)                                       ? 1
+         : (dataType == LUMP_DATA_TYPE_DATA16)                                      ? 2
+         : (dataType == LUMP_DATA_TYPE_DATA32 || dataType == LUMP_DATA_TYPE_DATAF) ? 4
+                                                                                    : 0;
+  }
+
+  /**
+   * Bounded string length (portable replacement for POSIX `strnlen`).
+   */
+  inline uint8_t boundedStrlen(const char *s, uint8_t maxLen) {
+    uint8_t n = 0;
+    while (n < maxLen && s[n] != '\0') {
+      ++n;
+    }
+    return n;
+  }
+
+} // namespace Internal
+} // namespace LumpDeviceBuilder
+
 /* Namespace for the LUMP Device Builder Library. */
 namespace LumpDeviceBuilder {
 
@@ -58,19 +89,13 @@ namespace LumpDeviceBuilder {
   /* Represents a value span of a LUMP device mode. */
   class LumpValueSpan {
     public:
-      virtual ~LumpValueSpan()                        = default;
-      LumpValueSpan(const LumpValueSpan &)            = default;
-      LumpValueSpan(LumpValueSpan &&)                 = default;
-      LumpValueSpan &operator=(const LumpValueSpan &) = default;
-      LumpValueSpan &operator=(LumpValueSpan &&)      = default;
-
       /**
        * Creates a value span.
        *
        * @param min Minimum value of the span.
        * @param max Maximum value of the span.
        */
-      LumpValueSpan(float min, float max);
+      constexpr LumpValueSpan(float min, float max) : min{min}, max{max}, isValid{min <= max}, isExist{true} {}
 
       /**
        * Creates an empty value span.
@@ -78,7 +103,7 @@ namespace LumpDeviceBuilder {
        * @param isExist Whether the value span exists (default: `false`).
        * @note Used to allow the handshake process to skip sending value span information.
        */
-      LumpValueSpan(bool isExist = false);
+      constexpr LumpValueSpan(bool isExist = false) : isExist{isExist} {}
 
       float min{0};
       float max{0};
@@ -89,12 +114,6 @@ namespace LumpDeviceBuilder {
   /* Represents a mode of a LUMP device. */
   class LumpMode {
     public:
-      LumpMode(const LumpMode &);
-      LumpMode &operator=(const LumpMode &);
-      LumpMode(LumpMode &&) noexcept;
-      LumpMode &operator=(LumpMode &&) noexcept;
-      virtual ~LumpMode();
-
       /**
        * Creates a mode.
        *
@@ -152,7 +171,7 @@ namespace LumpDeviceBuilder {
        * @warning When the `power` parameter is set to `true` in any mode,
        *          constant power on SPIKE Hub pin 2 is enabled across all modes.
        */
-      LumpMode(
+      constexpr LumpMode(
           const char *name,
           uint8_t dataType,
           uint8_t numData,
@@ -166,28 +185,44 @@ namespace LumpDeviceBuilder {
           uint8_t mapOut     = LUMP_INFO_MAPPING_NONE,
           bool power         = false,
           bool flagsInName   = false
-      );
+      )
+          : raw{raw},
+            pct{pct},
+            si{si},
+            name{name},
+            symbol{symbol},
+            dataType{dataType},
+            numData{numData},
+            figures{figures},
+            decimals{decimals},
+            mapIn{mapIn},
+            mapOut{mapOut},
+            power{power},
+            flagsInName{flagsInName},
+            dataTypeSize{Internal::sizeOfLumpDataType(dataType)},
+            dataMsgSize{static_cast<uint8_t>(numData * Internal::sizeOfLumpDataType(dataType))} {}
 
-      /* Mode info */
-      char name[LUMP_MAX_SHORT_NAME_SIZE + 8]{"null"};
+      /**
+       * Whether the host can write data to this mode.
+       */
+      constexpr bool isWritable() const { return mapOut != LUMP_INFO_MAPPING_NONE; }
+
+      /* Mode info (immutable; the whole table can live in flash when declared `const`) */
+      LumpValueSpan raw;
+      LumpValueSpan pct;
+      LumpValueSpan si;
+      const char *name;   // Validated / truncated when sent during the handshake.
+      const char *symbol; // Truncated to LUMP_MAX_UOM_SIZE when sent during the handshake.
       uint8_t dataType;
       uint8_t numData;
       uint8_t figures;
       uint8_t decimals;
-      char symbol[LUMP_MAX_UOM_SIZE + 1]{""};
-      LumpValueSpan raw;
-      LumpValueSpan pct;
-      LumpValueSpan si;
       uint8_t mapIn;
       uint8_t mapOut;
       bool power;
       bool flagsInName;
-
-      /* Data message (received from the host) */
       uint8_t dataTypeSize;
       uint8_t dataMsgSize;
-      void *dataMsg{nullptr};
-      bool hasDataMsg{false};
   };
 
   /**
@@ -198,11 +233,11 @@ namespace LumpDeviceBuilder {
   template <typename T>
   class LumpDevice {
     public:
-      virtual ~LumpDevice()                     = default;
-      LumpDevice(const LumpDevice &)            = default;
-      LumpDevice(LumpDevice &&)                 = default;
-      LumpDevice &operator=(const LumpDevice &) = default;
-      LumpDevice &operator=(LumpDevice &&)      = default;
+      virtual ~LumpDevice() { free(dataMsgBuf); }
+      LumpDevice(const LumpDevice &)            = delete; // owns dataMsgBuf
+      LumpDevice(LumpDevice &&)                 = delete;
+      LumpDevice &operator=(const LumpDevice &) = delete;
+      LumpDevice &operator=(LumpDevice &&)      = delete;
 
       /**
        * Creates a device.
@@ -234,7 +269,7 @@ namespace LumpDeviceBuilder {
           uint8_t txPin,
           uint8_t type,
           uint32_t speed,
-          LumpMode *modes,
+          const LumpMode *modes,
           uint8_t numModes,
           uint8_t view       = LUMP_VIEW_ALL,
           uint32_t fwVersion = 10000000,
@@ -520,6 +555,21 @@ namespace LumpDeviceBuilder {
       void sendDataMsg(void *payload, uint8_t len, uint8_t mode);
 
       /**
+       * Gets the storage of the data message of the specified mode.
+       *
+       * @param mode Mode number.
+       * @retval uint8_t* Pointer into `dataMsgBuf` (4-byte aligned) if the mode is writable.
+       * @retval nullptr Otherwise.
+       */
+      uint8_t *dataMsgPtr(uint8_t mode);
+
+      /**
+       * Rounds a size up to a multiple of 4 so every mode's buffer stays 4-byte aligned
+       * (needed for int32/float access on Cortex-M0/M0+ and RV32 cores without misaligned access).
+       */
+      static constexpr uint16_t align4(uint16_t n) { return static_cast<uint16_t>((n + 3u) & ~3u); }
+
+      /**
        * Initializes the watchdog timer.
        */
       void (*initWdtCallback)() = nullptr;
@@ -542,7 +592,7 @@ namespace LumpDeviceBuilder {
       /* Device info */
       uint8_t type;
       uint32_t speed;
-      LumpMode *modes;
+      const LumpMode *modes;
       uint8_t numModes;
       uint8_t view;
       uint32_t fwVersion;
@@ -575,6 +625,11 @@ namespace LumpDeviceBuilder {
       uint8_t rxIdx{0};
       bool _hasNack{false};
 
+      /* Data messages received from the host (one shared buffer for all writable modes) */
+      uint8_t *dataMsgBuf{nullptr};
+      uint16_t dataMsgBufSize{0};
+      uint16_t dataMsgFlags{0}; // bit n = new data message for mode n
+
       /* Command write message */
       uint8_t cmdWriteData[LUMP_MAX_MSG_SIZE]{};
       uint8_t cmdWriteDataSize{0};
@@ -602,14 +657,6 @@ namespace LumpDeviceBuilder::Internal {
    * @return Checksum of the message.
    */
   uint8_t calcChecksum(uint8_t *msg, uint8_t size);
-
-  /**
-   * Queries size of the LUMP data type.
-   *
-   * @param dataType LUMP data type.
-   * @return Size of the data type in bytes.
-   */
-  uint8_t sizeOfLumpDataType(uint8_t dataType);
 
   /**
    * Queries log2 (up to 32).

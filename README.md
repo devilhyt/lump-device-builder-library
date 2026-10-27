@@ -202,13 +202,19 @@ For this device, two modes are implemented:
 - mode 1: Digital Reader
 
 ```cpp
-LumpMode modes[]{
+const LumpMode modes[]{
   {"Analog", DATA16, 1, 4, 0, "raw", {0, 4095}, {0, 100}, {0, 4095}},
   {"Digital", DATA8, 1, 1, 0, "raw", {0, 1}, {0, 100}, {0, 1}}
 };
 
 uint8_t numModes = sizeof(modes) / sizeof(LumpMode);
 ```
+
+> [!TIP]
+> Declaring the mode table `const` lets the compiler place it in flash instead of RAM.
+> On 32-bit MCUs each mode takes 56 bytes, so a 10-mode table saves 560 bytes of RAM.
+> This matters on small parts such as STM32F0/C0 or CH32V003.
+> A non-`const` table also works; it is simply kept in RAM.
 
 Parameter descriptions:
 
@@ -235,6 +241,9 @@ LumpMode(const char *name, uint8_t dataType, uint8_t numData,
 
     Names exceeding the limit will be truncated.
 
+  - The string is not copied; it is read during each handshake.
+    It must remain valid for the lifetime of the device, e.g., a string literal or a global or `static` array.
+
 - `dataType`: Data type.
   - Possible values: `DATA8`, `DATA16`, `DATA32`, `DATAF`.
 - `numData`: Number of data.
@@ -251,6 +260,7 @@ LumpMode(const char *name, uint8_t dataType, uint8_t numData,
   - Rules:
     - Set to empty string `""` or `nullptr` if not required.
     - Length limit (excluding null terminator): `4`
+    - Like `name`, the string is not copied and must remain valid for the lifetime of the device.
 - `raw`: Raw value span (default: `false`).
   - When set to `false`, this value span will not be provided to the host. The host will use the default range `[0, 1023]`.
 - `pct`: Percentage value span (default: `false`).
@@ -280,7 +290,7 @@ Parameter descriptions:
 template <typename T>
 LumpDevice(T *uart, uint8_t rxPin, uint8_t txPin,
            uint8_t type, uint32_t speed,
-           LumpMode *modes, uint8_t numModes,
+           const LumpMode *modes, uint8_t numModes,
            ...);
 ```
 
